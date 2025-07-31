@@ -13,7 +13,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{
-    add_suffix_prefix, delta, get_partitioner_from_file_settings, parquet::batches_by_partition,
+    add_suffix_prefix, delta, get_partitioner_from_file_settings, iceberg, parquet::batches_by_partition,
     two_phase_committer::TwoPhaseCommitterOperator, CommitState, CommitStyle, FileNaming,
     FileSystemTable, FilenameStrategy, FinishedFile, MultiPartWriterStats, RollingPolicy,
     TableType,
@@ -243,6 +243,16 @@ impl<V: LocalWriter + Send + 'static> TwoPhaseCommitter for LocalFileSystemWrite
                         .await?,
                 ),
             },
+            CommitStyle::Iceberg => CommitState::Iceberg {
+                last_snapshot_id: None,
+                table: Box::new(
+                    iceberg::load_or_create_table(
+                        &storage_provider, 
+                        &schema.schema_without_timestamp(),
+                        "arroyo_table" // TODO: Make table name configurable
+                    ).await?,
+                ),
+            },
             CommitStyle::Direct => CommitState::VanillaParquet,
         });
 
@@ -328,6 +338,17 @@ impl<V: LocalWriter + Send + 'static> TwoPhaseCommitter for LocalFileSystemWrite
                 delta::commit_files_to_delta(&finished_files, table, *last_version).await?
             {
                 *last_version = version;
+            }
+        }
+        if let CommitState::Iceberg {
+            last_snapshot_id,
+            table,
+        } = self.commit_state.as_mut().unwrap()
+        {
+            if let Some(snapshot_id) =
+                iceberg::commit_files_to_iceberg(&finished_files, table, *last_snapshot_id).await?
+            {
+                *last_snapshot_id = Some(snapshot_id);
             }
         }
         Ok(())

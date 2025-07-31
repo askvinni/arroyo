@@ -1,4 +1,5 @@
 pub mod delta;
+pub mod iceberg;
 mod sink;
 mod source;
 

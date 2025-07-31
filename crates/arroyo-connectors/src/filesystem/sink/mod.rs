@@ -37,6 +37,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use deltalake::DeltaTable;
+use crate::filesystem::sink::iceberg::IcebergTableStub;
 use futures::{stream::FuturesUnordered, Future};
 use futures::{stream::StreamExt, TryStreamExt};
 use object_store::{multipart::PartId, path::Path, MultipartId};
@@ -47,6 +48,7 @@ use uuid::Uuid;
 use arroyo_types::*;
 pub mod arrow;
 mod delta;
+mod iceberg;
 pub mod json;
 pub mod local;
 pub mod parquet;
@@ -98,6 +100,7 @@ impl<R: MultiPartWriter + Send + 'static> FileSystemSink<R> {
         let commit_strategy = match file_settings.as_ref().unwrap().commit_style.unwrap() {
             CommitStyle::Direct => CommitStrategy::PerSubtask,
             CommitStyle::DeltaLake => CommitStrategy::PerOperator,
+            CommitStyle::Iceberg => CommitStrategy::PerOperator,
         };
 
         TwoPhaseCommitterOperator::new(Self {
@@ -470,6 +473,10 @@ pub enum CommitState {
         last_version: i64,
         table: Box<DeltaTable>,
     },
+    Iceberg {
+        last_snapshot_id: Option<i64>,
+        table: Box<IcebergTableStub>,
+    },
     VanillaParquet,
 }
 
@@ -754,6 +761,16 @@ where
                     load_or_create_table(&object_store, &schema.schema_without_timestamp()).await?,
                 ),
             },
+            CommitStyle::Iceberg => CommitState::Iceberg {
+                last_snapshot_id: None,
+                table: Box::new(
+                    iceberg::load_or_create_table(
+                        &object_store,
+                        &schema.schema_without_timestamp(),
+                        "arroyo_table" // TODO: Make table name configurable
+                    ).await?,
+                ),
+            },
             CommitStyle::Direct => CommitState::VanillaParquet,
         };
         let mut file_naming = file_settings.file_naming.clone().unwrap_or(FileNaming {
@@ -984,6 +1001,17 @@ where
                 *last_version = new_version;
             }
         }
+        if let CommitState::Iceberg {
+            last_snapshot_id,
+            table,
+        } = &mut self.commit_state
+        {
+            if let Some(new_snapshot_id) =
+                iceberg::commit_files_to_iceberg(&finished_files, table, *last_snapshot_id).await?
+            {
+                *last_snapshot_id = Some(new_snapshot_id);
+            }
+        }
         let finished_message = CheckpointData::Finished {
             max_file_index: self.max_file_index,
             delta_version: self.delta_version(),
@@ -995,6 +1023,7 @@ where
     fn delta_version(&mut self) -> i64 {
         match &self.commit_state {
             CommitState::DeltaLake { last_version, .. } => *last_version,
+            CommitState::Iceberg { last_snapshot_id, .. } => last_snapshot_id.unwrap_or(0),
             CommitState::VanillaParquet => 0,
         }
     }
